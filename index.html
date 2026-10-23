@@ -260,6 +260,12 @@
         <div class="hint" style="padding:4px 0 0;">只对超过该字数的章节生效；文档自带的一级标题永远是章节边界。改完点下方按钮可立即重新分章。</div>
       </div>
       <div class="field">
+        <label style="display:flex;align-items:flex-start;gap:6px;line-height:1.45;">
+          <input type="checkbox" id="chkTocSplit" checked style="margin-top:2px;flex:0 0 auto;"/>
+          <span>导出时按二级标题拆成独立文件（微信读书等<u>按文件</u>建目录的阅读器必备，否则二级目录点不动；标准阅读器两种都正常）</span>
+        </label>
+      </div>
+      <div class="field">
         <button id="btnResplit" style="width:100%;padding:6px 8px;">按此重新分章</button>
       </div>
 
@@ -634,9 +640,10 @@ function splitH2ToChapters(idx){
   const newChapters=starts.map(s=>({id:uid(), title:s.title, html:s.html.join('')||'<p><br/></p>'}));
   book.chapters.splice(idx,1,...newChapters);
   refreshCounts();
-  currentId=newChapters[0].id;
+  /* 不要提前把 currentId 指向新章节，否则 selectChapter 会把编辑器残留内容写进新章节首章。
+     让 selectChapter 先把编辑器内容提交回被拆掉的旧章节（已移除→安全跳过），再切换到首章。 */
   renderAll(); save();
-  if(currentId) selectChapter(currentId);
+  if(newChapters[0]) selectChapter(newChapters[0].id);
 }
 function autoSplitCurrent(idx){
   const ch=book.chapters[idx]; if(!ch) return;
@@ -661,20 +668,24 @@ function commitEditor(){
   tmp.querySelectorAll('img').forEach(img=>{
     const name=img.getAttribute('data-img');
     const src=img.getAttribute('src')||'';
-    let n=name;
-    if(n && book._images[n]){
-      // 已有占位图，保持
+    if(name && book._images[name]){
+      /* 本编辑器插入的占位图：清掉临时 blob:/data: src，只留 data-img 占位，
+         导出处再统一还原成 images/ 真实路径（避免把临时地址写进书里/存进草稿） */
+      img.removeAttribute('src');
     } else if(/^data:image\//i.test(src)){
-      n=genImgName();
+      /* 粘贴进来的裸 data: 图：入库并转占位 */
+      const n=genImgName();
       const mm=src.match(/^data:image\/(\w+);base64,(.*)$/);
       const ext=(mm&&mm[1])||'png';
       book._images[n]={b64:mm[2], ext:ext==='jpeg'?'jpg':ext, mime:'image/'+(ext==='jpg'?'jpeg':ext)};
       img.setAttribute('data-img', n);
       img.removeAttribute('src');
     } else {
-      img.removeAttribute('src');
+      /* 外链 / 相对路径图片（如 Markdown ![alt](url)）：保留原 src，只去掉无效 blob: 临时地址；
+         无效 / 孤立的 data-img 占位一并清掉，避免导出出坏图 */
+      if(/^blob:/i.test(src)) img.removeAttribute('src');
+      if(name && !book._images[name]) img.removeAttribute('data-img');
     }
-    if(n) img.setAttribute('data-img', n); else img.removeAttribute('data-img');
   });
   cur.html=tmp.innerHTML;
   cur.wordCount=countWords(cur.html);
@@ -747,6 +758,8 @@ function onEdit(){
 /* 事件委托：章节树 */
 $('tree').addEventListener('click', e=>{
   const li=e.target.closest('li'); if(!li) return;
+  /* 点标题输入框时，不切换章节、不重渲染章节树：否则 input 会被重建导致无法聚焦编辑 */
+  if(e.target.classList && e.target.classList.contains('ch-title')) return;
   const id=li.dataset.id;
   const act=e.target.dataset.act;
   if(readingMode){ toggleReading(); }
@@ -762,9 +775,10 @@ $('tree').addEventListener('click', e=>{
     if(act==='del'){
       const wasViewing=(currentId===id);
       book.chapters.splice(idx,1);
-      if(wasViewing){ currentId=book.chapters[0]?book.chapters[0].id:null; }
+      /* 断开绑定：被删章一旦被移除，其编辑器残留内容绝不能写进切换后的新章 */
+      if(wasViewing){ currentId=null; }
       refreshCounts(); renderAll(); save();
-      if(currentId) selectChapter(currentId);
+      if(book.chapters[0]) selectChapter(book.chapters[0].id);
       return;
     }
     refreshCounts(); renderAll(); save();
@@ -773,7 +787,8 @@ $('tree').addEventListener('click', e=>{
   }
   commitEditor(); selectChapter(id);
 });
-$('tree').addEventListener('change', e=>{
+/* 章节标题：像书名那样随输随改（input 事件实时同步，不重建输入框，不掉焦点） */
+$('tree').addEventListener('input', e=>{
   if(e.target.classList.contains('ch-title')){
     const li=e.target.closest('li'); const ch=book.chapters.find(c=>c.id===li.dataset.id);
     if(ch){ ch.title=e.target.value; renderToc(); renderStats(); save(); }
@@ -828,21 +843,29 @@ $('toolbar').addEventListener('mousedown', e=>{
   e.preventDefault();
   editor.focus();
   if(cmd==='formatBlock'){ document.execCommand('formatBlock',false,val); }
+  else if(cmd==='justifyLeft'||cmd==='justifyCenter'||cmd==='justifyRight'){
+    const map={justifyLeft:'left',justifyCenter:'center',justifyRight:'right'};
+    applyToBlocksInSelection('textAlign', map[cmd]);
+  }
   else { document.execCommand(cmd,false,null); }
   onEdit();
 });
 editor.addEventListener('input', onEdit);
 
-/* 对选中范围内的块级元素应用样式（居左/居中/居右用 execCommand；首行缩进用此函数） */
+/* 对选中范围内的块级元素应用样式（居左/居中/居右/首行缩进）。
+   注意：Chrome 的 contenteditable 默认把每段正文包成 <div>（而非 <p>），所以选择器必须包含 div，
+   否则「正文」的居中/居左/居右/首行缩进点了完全不生效（二级标题是 h2 所以没事）。 */
 function applyToBlocksInSelection(prop, value){
   editor.focus();
   const sel=window.getSelection();
   if(!sel||!sel.rangeCount) return;
   const range=sel.getRangeAt(0);
-  let blocks=[...editor.querySelectorAll('p,h1,h2,h3,blockquote,li')].filter(b=>range.intersectsNode(b));
+  let blocks=[...editor.querySelectorAll('p,h1,h2,h3,blockquote,li,div')].filter(b=>range.intersectsNode(b));
+  /* 只保留最内层的块：避免把祖先 div 一起加上样式（嵌套时会整段误居中） */
+  blocks=blocks.filter(b=>!blocks.some(o=>o!==b && b.contains(o)));
   if(!blocks.length && sel.anchorNode){
     let n=sel.anchorNode; if(n.nodeType===3) n=n.parentNode;
-    const b=n.closest && n.closest('p,h1,h2,h3,blockquote,li');
+    const b=n.closest && n.closest('p,h1,h2,h3,blockquote,li,div');
     if(b) blocks=[b];
   }
   blocks.forEach(b=>{
@@ -913,7 +936,10 @@ $('mCover').addEventListener('change',e=>{
 /* 顶栏按钮 */
 $('addCh').addEventListener('click',()=>{
   const ch=newChapter('第 '+(book.chapters.length+1)+' 章');
-  book.chapters.push(ch); currentId=ch.id;
+  book.chapters.push(ch);
+  /* 不要先改 currentId：selectChapter 内部会先把编辑器内容写回「当前章节」，
+     若提前把 currentId 指向新章节，会把上一章的内容误写进新章节。
+     这里直接交给 selectChapter 处理：它先提交旧章节，再切换到空的新章节。 */
   refreshCounts(); selectChapter(ch.id); save();
 });
 $('impBtn').addEventListener('click', ()=> $('importFile').click());
@@ -1017,6 +1043,7 @@ function importMarkdown(text, filename){
     const rawChapters=mdSplitChapters(text);
     if(!rawChapters.length) throw new Error('未能从 Markdown 解析出任何内容');
     const chapters=finalizeChapters(rawChapters);
+    chapters.forEach(c=>{ c.html=healEntities(c.html||''); });
     currentId=null; // 导入前断开编辑器绑定，避免旧编辑器内容覆盖新章节
     book={ meta:{ title:(filename||'').replace(/\.(md|markdown)$/i,'')||'未命名书籍', author:'', language:'zh', date:'', cover:null, style:{lineHeight:1.8,align:'justify'} }, chapters, _images:{} };
     if(!book.chapters[0]) book.chapters[0]=newChapter('第 1 章');
@@ -1033,9 +1060,17 @@ function importTxt(text, filename){
   try{
     const body=text.replace(/\r\n/g,'\n').trim();
     if(!body) throw new Error('文件为空');
-    const paras=body.split(/\n\s*\n/).filter(s=>s.trim()).map(p=>'<p>'+escapeHtml(p.trim().replace(/\n/g,'<br/>'))+'</p>').join('');
+    let paras;
+    if(!/\n\s*\n/.test(body) && /◇[\s\S]*\d{4}\s*年/.test(body)){
+      /* 整块文本以 ◇ 日期 分隔（如《千虑集》历年诗作）：自动重构为「逐诗 / 逐句居中」结构，
+         韵文逐句居中、散文整段左对齐、批注单独成段，避免导入/导出变成一整段 */
+      paras=reformatQianlvBlob(body);
+    } else {
+      paras=body.split(/\n\s*\n/).filter(s=>s.trim()).map(p=>'<p>'+escapeHtml(p.trim().replace(/\n/g,'<br/>'))+'</p>').join('');
+    }
     const title=(filename||'').replace(/\.[^.]+$/,'')||'导入文本';
     const chapters=finalizeChapters([{title:title, html:paras}]);
+    chapters.forEach(c=>{ c.html=healEntities(c.html||''); });
     currentId=null; // 导入前断开编辑器绑定，避免旧编辑器内容覆盖新章节
     book={ meta:{ title, author:'', language:'zh', date:'', cover:null, style:{lineHeight:1.8,align:'justify'} }, chapters, _images:{} };
     currentId=null;
@@ -1134,7 +1169,9 @@ async function importEpub(file){
     if(!chapters.length) throw new Error('未在 EPUB 中找到可编辑的正文章节');
 
     currentId=null; // 导入前断开编辑器绑定，避免旧编辑器内容覆盖新章节
-    book={meta, chapters:finalizeChapters(chapters), _images:imgStore};
+    const finalChapters=finalizeChapters(chapters);
+    finalChapters.forEach(c=>{ c.html=healEntities(c.html||''); });
+    book={meta, chapters:finalChapters, _images:imgStore};
     currentId=null;
     refreshCounts(); selectChapter(book.chapters[0].id); save();
     alert('导入成功：'+book.chapters.length+' 章，'+totalWords()+' 字，'+countImages()+' 张图。\n可继续编辑，或点「导出 EPUB」重新导出。');
@@ -1219,13 +1256,92 @@ $('rdApply').addEventListener('click', ()=>{
 });
 
 /* ---------- EPUB 生成（全后台） ---------- */
+/* 修复「实体被二次转义」：粘贴/导入的正文里若本来就带 &nbsp;，编辑器会把 & 再转义成 &amp;，
+   阅读器里就原样显示成 "&nbsp;"（还会层层叠加成 &amp;nbsp;）。这里把多层 &amp;nbsp; 逐层还原并统一成空格。 */
+function healEntities(html){
+  let s=String(html==null?'':html);
+  /* 逐层还原被多次转义的常见实体：&amp;nbsp; → &nbsp; → 空格 */
+  const ENT='nbsp|#160|#xa0|ensp|emsp|thinsp|amp|lt|gt|quot|apos|mdash|ndash|hellip|ldquo|rdquo|lsquo|rsquo|middot|bull|times|divide|deg|plusmn|laquo|raquo|copy|reg|trade';
+  const re=new RegExp('&amp;('+ENT+');','gi');
+  for(let i=0;i<8;i++){
+    const before=s;
+    s=s.replace(re,'&$1;');
+    if(s===before) break;
+  }
+  s=s.replace(/&nbsp;|&#160;|&#xa0;/gi,' ');
+  return s;
+}
+/* 把常见「命名实体」转成真正的 Unicode 字符；amp/lt/gt/quot/apos 保留为实体（XML 安全转义）。 */
+const NAMED_ENT={nbsp:' ',ensp:'\u2002',emsp:'\u2003',thinsp:'\u2009',mdash:'\u2014',ndash:'\u2013',hellip:'\u2026',ldquo:'\u201C',rdquo:'\u201D',lsquo:'\u2018',rsquo:'\u2019',middot:'\u00B7',bull:'\u2022',times:'\u00D7',divide:'\u00F7',deg:'\u00B0',plusmn:'\u00B1',laquo:'\u00AB',raquo:'\u00BB',copy:'\u00A9',reg:'\u00AE',trade:'\u2122'};
+function decodeNamedEntities(s){
+  return String(s).replace(/&([a-zA-Z][a-zA-Z0-9]*);/g,(m,n)=>{
+    const k=n.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(NAMED_ENT,k)?NAMED_ENT[k]:m;
+  });
+}
 function cleanXhtml(html){
-  return String(html||'')
+  return decodeNamedEntities(healEntities(html))
     .replace(/<br\s*\/?>/gi,'<br/>')
     .replace(/<hr\s*\/?>/gi,'<hr/>')
     .replace(/<img([^>]*?)\s*\/?>/gi,'<img$1/>')
     .replace(/&nbsp;/g,' ')
     .replace(/&(?!(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)/g,'&amp;');
+}
+/* 把「被压成一团的历年诗稿」（整段文本、靠 ◇ 日期 ◇ 分隔、内部含 &amp;nbsp;）重构成标准结构：
+   日期行单独成段；韵文按 。！？ 逐句居中；散文（含长句）整段左对齐；· · ·批 注 单独成段。
+   仅当检测到「长文本 + 多个 ◇ 日期 标记」时才生效，正常章节原样返回。 */
+function reformatQianlvBlob(html){
+  let text=String(html==null?'':html).replace(/<[^>]+>/g,'');
+  text=healEntities(text); // 先把 &amp;nbsp; 等实体还原成空格，否则 ◇ 与日期之间的 &amp;nbsp; 会挡住下面的标记匹配
+  const dateRe=/◇\s*\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日/g;
+  const markers=(text.match(dateRe)||[]).length;
+  if(text.length<300 || markers<2) return html; // 不是团状结构，原样返回
+  const s=text;
+  const SEP=/◇\s*(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)\s*◇/;
+  const parts=s.split(SEP);
+  const esc=t=>t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const splitLines=t=>t.split(/(?<=。|！|？)/).map(x=>x.trim()).filter(Boolean);
+  const isProse=lines=>lines.some(l=>l.length>26);
+  let out=[];
+  for(let i=1;i<parts.length;i+=2){
+    const date=parts[i].trim();
+    let body=parts[i+1]||'';
+    const m=body.match(/·\s*·\s*·\s*批\s*注\s*[:：]/);
+    let anno='';
+    if(m){ anno=body.slice(m.index).trim(); body=body.slice(0,m.index); }
+    out.push('<p>◇ '+date+' ◇</p>');
+    const lines=splitLines(body);
+    if(isProse(lines)){ out.push('<p>'+esc(body.trim())+'</p>'); }
+    else { lines.forEach(l=>out.push('<p style="text-align: center;">'+esc(l)+'</p>')); }
+    if(anno){ out.push('<p>· · ·</p>'); out.push('<p>'+esc(anno.replace(/^·\s*·\s*·\s*/,'').trim())+'</p>'); }
+    out.push('<p><br/></p>');
+  }
+  return out.join('');
+}
+/* 非破坏式 HTML→XHTML 序列化：浏览器宽松解析后再规整，保留所有标签、style（对齐）与换行 */
+function serializeXhtml(node){
+  const VOID={br:1,hr:1,img:1,input:1,meta:1,link:1,area:1,base:1,col:1,embed:1,param:1,source:1,track:1,wbr:1};
+  let out='';
+  node.childNodes.forEach(n=>{
+    if(n.nodeType===3){ out+=escapeXml(n.nodeValue); }
+    else if(n.nodeType===1){
+      const tag=n.tagName.toLowerCase();
+      let attrs='';
+      for(let i=0;i<n.attributes.length;i++){
+        const a=n.attributes[i];
+        if(a.name==='data-img') continue; // 已在导出前转为 src
+        attrs+=' '+a.name+'="'+escapeXml(a.value)+'"';
+      }
+      if(VOID[tag]){ out+='<'+tag+attrs+'/>'; }
+      else { out+='<'+tag+attrs+'>'+serializeXhtml(n)+'</'+tag+'>'; }
+    } /* 注释等其它节点忽略 */
+  });
+  return out;
+}
+function lenientToXhtml(html){
+  const tmp=document.createElement('div');
+  tmp.innerHTML=html||'';
+  return serializeXhtml(tmp);
 }
 function collectImages(){
   const map=new Map(); const files=[];
@@ -1245,40 +1361,107 @@ function collectImages(){
 }
 function mediaType(ext){ return ({png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',bmp:'image/bmp'})[ext]||'image/png'; }
 
-function buildChapterXhtml(ch,i,imgMap){
+function getTocSplit(){ const el=$('chkTocSplit'); return el? el.checked : true; }
+/* 把章节切成「导出文件（section）」列表。
+   split=true：每个 h2/h3 二级/三级标题切成独立 XHTML 文件（年份章→每首诗一个文件）。
+     这样「按文件建目录」的阅读器（微信读书等）也能让每个二级标题成为可点章节、跳转生效。
+   split=false：整章保留为一个文件，h2/h3 通过 toc.ncx 的锚点（#id）跳转（标准阅读器可用）。 */
+function buildSections(){
+  const split=getTocSplit();
+  const out=[]; const ctr={v:0};
+  const href=()=>'chap'+(++ctr.v)+'.xhtml';
+  if(!split){
+    book.chapters.forEach((ch,i)=>{
+      out.push({ href:href(), title:ch.title||('第'+(i+1)+'章'), chapter:i, body:ch.html||'<p><br/></p>', level:1, single:true, isHead:false });
+    });
+    return out;
+  }
+  book.chapters.forEach((ch,ci)=>{
+    const chapterTitle=ch.title||('第'+(ci+1)+'章');
+    const tmp=document.createElement('div'); tmp.innerHTML=(ch.html||'<p><br/></p>');
+    const nodes=[...tmp.childNodes];
+    const headIdx=[];
+    nodes.forEach((n,idx)=>{ if(n.nodeType===1 && (n.tagName==='H2'||n.tagName==='H3')) headIdx.push(idx); });
+    if(headIdx.length===0){
+      out.push({ href:href(), title:chapterTitle, chapter:ci, body:ch.html||'<p><br/></p>', level:1, single:true, isHead:false });
+      return;
+    }
+    /* 第一个二级标题之前的内容（序言 / 引言 / 章名 h1）单独成文件作为「章首页」。
+       始终生成章首页：① 微信读书按文件建目录，章首页让「年份 / 分卷」成为可点独立页；
+       ② 若引言已自带 <h1> 章名则不重复前置，避免章名显示两遍（早期缺陷）。 */
+    const introNodes=nodes.slice(0, headIdx[0]);
+    const introHtml=introNodes.map(n=> n.nodeType===1? n.outerHTML : escapeHtml(n.textContent)).join('');
+    const firstIntro=introNodes[0];
+    const introStartsWithH1 = !!(firstIntro && firstIntro.nodeType===1 && firstIntro.tagName==='H1');
+    const headBody = (introStartsWithH1 ? '' : '<h1>'+escapeXml(chapterTitle)+'</h1>') + introHtml;
+    out.push({ href:href(), title:chapterTitle, chapter:ci, body:headBody, level:1, single:false, isHead:true });
+    /* 每个二级/三级标题（含其下方直到下一个标题的内容）各成一个文件 */
+    let lastH2=null;
+    for(let h=0; h<headIdx.length; h++){
+      const start=headIdx[h];
+      const end=(h+1<headIdx.length)?headIdx[h+1]:nodes.length;
+      const segNodes=nodes.slice(start,end);
+      const segHtml=segNodes.map(n=> n.nodeType===1? n.outerHTML : escapeHtml(n.textContent)).join('');
+      const el=nodes[start];
+      const lvl=(el.tagName==='H2')?2:3;
+      const t=(el.textContent||'').trim()||'(无标题)';
+      const sec={ href:href(), title:t, chapter:ci, body:segHtml, level:lvl, single:false, isHead:false };
+      if(lvl===2){ sec.parent=null; lastH2=sec.href; } else { sec.parent=lastH2; }
+      out.push(sec);
+    }
+  });
+  return out;
+}
+function buildSectionXhtml(section, imgMap){
   const lang=book.meta.language||'zh';
-  const title=escapeXml(ch.title||('第'+(i+1)+'章'));
-  let html=ch.html||'<p><br/></p>';
+  const title=escapeXml(section.title||'');
+  let html=section.body||'<p><br/></p>';
   /* 去掉跳转高亮等临时视觉标记，避免导出到书里 */
   html=html.replace(/class="([^"]*)"/gi,(m,c)=>{
     const rest=c.split(/\s+/).filter(t=>t && t!=='toc-flash').join(' ');
     return rest?`class="${rest}"`:'';
   });
-  html=html.replace(/<img\b([^>]*?)\s+data-img="([^"]+)"([^>]*)>/gi, (m,a,name,b)=>{
-    const rec=book._images[name];
-    const src=rec?('images/'+name+'.'+rec.ext):'';
-    return `<img${a} src="${src}"${b}>`;
+  /* 图片：把 data-img 占位解析成打包进书的真实路径。
+     只保留一个 src，并清掉编辑器显示用的 blob:/data: 临时 src，
+     否则同一 <img> 出现两个 src 属性会让 XHTML 解析失败（早期「带图章节整章被剥光」根因）。
+     外链/相对路径图片（如 Markdown ![alt](url)）保留原 src，仅去掉无效 blob: 临时地址。 */
+  html=html.replace(/<img\b([^>]*)>/gi,(m,attrs)=>{
+    let a=attrs.replace(/\s*\/?\s*$/,'').trim();
+    const dm=a.match(/data-img="([^"]*)"/i);
+    const name=dm?dm[1]:null;
+    if(name && book._images[name]){
+      a=a.replace(/\s+src="[^"]*"/gi,'').replace(/\s+data-img="[^"]*"/gi,'').trim();
+      const src='images/'+name+'.'+book._images[name].ext;
+      return `<img${a?(' '+a):''} src="${src}"/>`;
+    }
+    a=a.replace(/\s+data-img="[^"]*"/gi,'').replace(/\s+src="blob:[^"]*"/gi,'').trim();
+    return `<img${a?(' '+a):''}/>`;
   });
-  html=html.replace(/\s+data-img="[^"]*"/gi,'');
-  const heads=chapterHeadingList(html, i+1);
+  /* 团状诗稿重构：仅当「整段文本、无二级/三级标题、无图片」时生效，避免误伤已结构化的章节或带图章节 */
+  if(!/<img\b/i.test(html) && !/<h2|<h3/i.test(html) && /^\s*<p>[\s\S]*<\/p>\s*$/.test(html)){
+    const reform=reformatQianlvBlob(html);
+    if(reform && reform!==html) html=reform;
+  }
+  /* 给 h2/h3 加锚点 id（标准阅读器内的子标题跳转；拆分模式下每条已是独立文件，id 不影响跳转但无害） */
+  const heads=chapterHeadingList(html, (section.chapter||0)+1);
   let k=0;
   html = html.replace(/<(h2|h3)\b([^>]*)>/gi, (m,tag,attrs)=>{
-    const id=(heads[k]&&heads[k].id)||('h'+(i+1)+'-'+(k+1));
+    const id=(heads[k]&&heads[k].id)||('h'+((section.chapter||0)+1)+'-'+(k+1));
     k++;
     return `<${tag} id="${id}"${attrs}>`;
   });
+  /* 实体还原 + 自闭合 + 转义（cleanXhtml），再经浏览器 DOM 重新序列化（lenientToXhtml），
+     保证产出合法 XHTML 且完整保留标签 / style 对齐 / 换行 / 图片——不再依赖易碎的 XML 严格解析与保底分支。 */
   const raw=cleanXhtml(html);
-  let xml=`<?xml version="1.0" encoding="utf-8"?>\n`+
+  let body=lenientToXhtml(raw);
+  if(!body || !body.trim()) body=raw;
+  const xml=`<?xml version="1.0" encoding="utf-8"?>\n`+
     `<html xmlns="http://www.w3.org/1999/xhtml" lang="${lang}" xml:lang="${lang}">\n`+
     `<head><meta charset="utf-8"/><title>${title}</title><link rel="stylesheet" href="style.css"/></head>\n`+
-    `<body>${raw}</body></html>`;
-  const doc=new DOMParser().parseFromString(xml,'application/xhtml+xml');
-  if(doc.querySelector('parsererror')){
-    const safe='<p>'+escapeXml((ch.html||'').replace(/<[^>]+>/g,''))+'</p>';
-    xml=xml.replace(`<body>${raw}</body>`,`<body>${safe}</body>`);
-  }
+    `<body>${body}</body></html>`;
   return xml;
 }
+function buildChapterXhtml(ch,i,map){ return buildSectionXhtml({title:ch.title, body:ch.html, chapter:i}, map); }
 function buildCss(s){
   s=s||{};
   const fs=s.fontSize||'16px', lh=s.lineHeight||1.8, al=s.align||'justify';
@@ -1289,13 +1472,12 @@ img{display:block;margin:1em auto;max-width:100%;height:auto;}
 .center,blockquote{text-align:center;}
 blockquote{color:#555;font-style:italic;}`;
 }
-function buildOpf(imgFiles){
+function buildOpf(sections, imgFiles){
   const m=book.meta; const lang=m.language||'zh';
   let manifest='', spine='';
-  book.chapters.forEach((ch,i)=>{
-    const n=i+1;
-    manifest+=`<item id="chap${n}" href="chap${n}.xhtml" media-type="application/xhtml+xml"/>`;
-    spine+=`<itemref idref="chap${n}"/>`;
+  sections.forEach((s,i)=>{
+    manifest+=`<item id="chap${i+1}" href="${s.href}" media-type="application/xhtml+xml"/>`;
+    spine+=`<itemref idref="chap${i+1}"/>`;
   });
   manifest+=`<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>`;
   manifest+=`<item id="ncx" href="toc.ncx" media-type="application/xnc+idpf+xml"/>`;
@@ -1303,6 +1485,7 @@ function buildOpf(imgFiles){
   if(m.cover) manifest+=`<item id="cover-img" href="${m.cover.name}" media-type="${mediaType(m.cover.ext||'jpeg')}"/>`;
   imgFiles.forEach(f=>{ manifest+=`<item id="img_${f.name}" href="images/${f.name}" media-type="${mediaType(f.ext)}"/>`; });
   const coverMeta=m.cover?`<meta name="cover" content="cover-img"/>`:'';
+  const modified=new Date().toISOString().replace(/\.\d+Z$/,'Z');
   return `<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="${lang}">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -1311,34 +1494,87 @@ function buildOpf(imgFiles){
   <dc:creator>${escapeXml(m.author||'佚名')}</dc:creator>
   <dc:language>${escapeXml(lang)}</dc:language>
   <dc:date>${escapeXml(m.date||new Date().getFullYear())}</dc:date>
+  <meta property="dcterms:modified">${modified}</meta>
   ${coverMeta}
 </metadata>
 <manifest>${manifest}</manifest>
 <spine toc="ncx">${spine}</spine>
 </package>`;
 }
-function buildNav(){
+function buildNav(sections){
   const lang=book.meta.language||'zh';
+  const byCh=new Map();
+  sections.forEach(s=>{ if(!byCh.has(s.chapter)) byCh.set(s.chapter,[]); byCh.get(s.chapter).push(s); });
   let items='';
-  book.chapters.forEach((c,i)=>{
-    const n=i+1;
-    const heads=chapterHeadingList(c.html, n);
-    let sub='';
-    heads.forEach(h=>{ sub+=`<li><a href="chap${n}.xhtml#${h.id}">${escapeXml(h.text)}</a></li>`; });
-    items+=`<li><a href="chap${n}.xhtml">${escapeXml(c.title||('第'+n+'章'))}</a>${sub?`<ol>${sub}</ol>`:''}</li>`;
+  book.chapters.forEach((ch,ci)=>{
+    const secs=byCh.get(ci)||[];
+    if(!secs.length) return;
+    const chTitle=ch.title||('第'+(ci+1)+'章');
+    const first=secs[0];
+    const subs=(first.isHead)?secs.slice(1):secs.slice(0);
+    const h2s=subs.filter(s=>s.level===2);
+    let ol='';
+    h2s.forEach(h2=>{
+      const kids=subs.filter(s=>s.level===3 && s.parent===h2.href);
+      const childOl=kids.map(k=>`<li><a href="${k.href}">${escapeXml(k.title)}</a></li>`).join('');
+      ol+=`<li><a href="${h2.href}">${escapeXml(h2.title)}</a>${childOl?`<ol>${childOl}</ol>`:''}</li>`;
+    });
+    subs.filter(s=>s.level===3 && !s.parent).forEach(o=>{ ol+=`<li><a href="${o.href}">${escapeXml(o.title)}</a></li>`; });
+    const subHtml=ol?`<ol>${ol}</ol>`:'';
+    items+=`<li><a href="${first.href}">${escapeXml(chTitle)}</a>${subHtml}</li>`;
   });
   return `<?xml version="1.0" encoding="utf-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="${lang}" xml:lang="${lang}">
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.daisy.org/2007/ops" lang="${lang}" xml:lang="${lang}">
 <head><meta charset="utf-8"/><title>目录</title></head>
 <body><nav epub:type="toc" id="toc"><h1>目录</h1><ol>${items}</ol></nav></body></html>`;
 }
-function buildNcx(){
-  const np=book.chapters.map((c,i)=>{const n=i+1;return `<navPoint id="np${n}" playOrder="${n}"><navLabel><text>${escapeXml(c.title||('第'+n+'章'))}</text></navLabel><content src="chap${n}.xhtml"/></navPoint>`;}).join('');
+function buildNcx(sections){
+  /* 单文件模式：章 + 章内 h2/h3 锚点（标准阅读器可跳转；微信读书不支持锚点故无效）。
+     拆分模式：每个二级/三级标题独立文件，content 直接指向该文件——微信读书等「按文件建目录」
+     的阅读器会把每条二级标题当成一个可点章节，跳转 100% 生效（苹果图书等也照常好用）。 */
+  let play=0, depth=1;
+  const byCh=new Map();
+  sections.forEach(s=>{ if(!byCh.has(s.chapter)) byCh.set(s.chapter,[]); byCh.get(s.chapter).push(s); });
+  let navMap='';
+  book.chapters.forEach((ch,ci)=>{
+    const secs=byCh.get(ci)||[];
+    if(!secs.length) return;
+    const chTitle=ch.title||('第'+(ci+1)+'章');
+    if(secs.length===1 && secs[0].single){
+      const file=secs[0].href;
+      const cId='np'+(++play);
+      navMap+=`<navPoint id="${cId}" playOrder="${play}"><navLabel><text>${escapeXml(chTitle)}</text></navLabel><content src="${file}"/></navPoint>`;
+      const heads=chapterHeadingList(ch.html, ci+1);
+      let pendingH2=null, h2Children='';
+      const closeH2=()=>{ if(pendingH2){ navMap+=`<navPoint id="${pendingH2.id}" playOrder="${pendingH2.play}"><navLabel><text>${escapeXml(pendingH2.text)}</text></navLabel><content src="${file}#${pendingH2.hid}"/>`+h2Children+'</navPoint>'; h2Children=''; } };
+      heads.forEach(h=>{
+        if(h.level>=3){ const id='np'+(++play); depth=Math.max(depth,3); h2Children+=`<navPoint id="${id}" playOrder="${play}"><navLabel><text>${escapeXml(h.text)}</text></navLabel><content src="${file}#${h.id}"/></navPoint>`; }
+        else { closeH2(); pendingH2={ id:'np'+(++play), play:play, text:h.text, hid:h.id }; h2Children=''; }
+      });
+      closeH2();
+      navMap+='</navPoint>';
+    } else {
+      const first=secs[0];
+      const cId='np'+(++play);
+      navMap+=`<navPoint id="${cId}" playOrder="${play}"><navLabel><text>${escapeXml(chTitle)}</text></navLabel><content src="${first.href}"/></navPoint>`;
+      const subs=(first.isHead)?secs.slice(1):secs.slice(0);
+      const h2s=subs.filter(s=>s.level===2);
+      h2s.forEach(h2=>{
+        const id='np'+(++play); depth=Math.max(depth,2);
+        navMap+=`<navPoint id="${id}" playOrder="${play}"><navLabel><text>${escapeXml(h2.title)}</text></navLabel><content src="${h2.href}"/></navPoint>`;
+        const kids=subs.filter(s=>s.level===3 && s.parent===h2.href);
+        kids.forEach(k=>{ const kid='np'+(++play); depth=Math.max(depth,3); navMap+=`<navPoint id="${kid}" playOrder="${play}"><navLabel><text>${escapeXml(k.title)}</text></navLabel><content src="${k.href}"/></navPoint>`; });
+        navMap+='</navPoint>';
+      });
+      subs.filter(s=>s.level===3 && !s.parent).forEach(o=>{ const id='np'+(++play); depth=Math.max(depth,3); navMap+=`<navPoint id="${id}" playOrder="${play}"><navLabel><text>${escapeXml(o.title)}</text></navLabel><content src="${o.href}"/></navPoint>`; });
+      navMap+='</navPoint>';
+    }
+  });
   return `<?xml version="1.0" encoding="utf-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
-<head><meta name="dtb:uid" content="urn:uuid:${uuid()}"/><meta name="dtb:depth" content="1"/></head>
+<head><meta name="dtb:uid" content="urn:uuid:${uuid()}"/><meta name="dtb:depth" content="${depth}"/></head>
 <docTitle><text>${escapeXml(book.meta.title||'未命名')}</text></docTitle>
-<navMap>${np}</navMap></ncx>`;
+<navMap>${navMap}</navMap></ncx>`;
 }
 const CONTAINER=`<?xml version="1.0" encoding="utf-8"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
@@ -1463,15 +1699,16 @@ async function exportEpub(){
   refreshCounts();
 
   const {map,files}=collectImages();
+  const sections=buildSections();
   const zip=new JSZip();
   zip.file('mimetype','application/epub+zip',{compression:'STORE'});
   zip.file('META-INF/container.xml',CONTAINER);
   const oebps=zip.folder('OEBPS');
-  oebps.file('content.opf',buildOpf(files));
-  oebps.file('nav.xhtml',buildNav());
-  oebps.file('toc.ncx',buildNcx());
+  oebps.file('content.opf',buildOpf(sections,files));
+  oebps.file('nav.xhtml',buildNav(sections));
+  oebps.file('toc.ncx',buildNcx(sections));
   oebps.file('style.css',buildCss(book.meta.style));
-  book.chapters.forEach((ch,i)=>{ oebps.file(`chap${i+1}.xhtml`,buildChapterXhtml(ch,i,map)); });
+  sections.forEach(s=>{ oebps.file(s.href, buildSectionXhtml(s,map)); });
   if(book.meta.cover){ oebps.file(book.meta.cover.name, book.meta.cover.data, {base64:true}); }
   if(files.length){
     const imgFolder=oebps.folder('images');
@@ -1528,6 +1765,10 @@ async function exportEpub(){
   book.chapters.forEach(c=>{
     if(!c.id || seen.has(c.id)){ c.id=uid(); healed++; }
     seen.add(c.id);
+    /* 修复历史草稿里被二次转义的实体（粘贴/导入时 &nbsp; 被存成 &amp;nbsp;） */
+    const before=c.html||'';
+    const after=healEntities(before);
+    if(after!==before){ c.html=after; healed++; }
   });
   /* √ 同上：即使 id 存在但重复，目录里的 data-goto 也会撞车（点甲章跳到乙章） */
   /* 单章过大（如整本书未分节）会在 contenteditable 里卡死，载入时提示可一键拆分 */
