@@ -127,6 +127,7 @@
   <div class="topbar">
     <span class="title">简易EPUB编辑器</span>
     <button id="readToggle" class="toggle">阅读模式</button>
+    <button id="newBtn" title="清空当前内容，新建空白书（草稿先自动备份，可找回）">新建文件</button>
     <button id="impBtn">导入文件</button>
     <input id="importFile" type="file" accept=".txt,.md,.markdown,.doc,.docx,.epub,text/plain,text/markdown,application/epub+zip" style="display:none"/>
     <button id="export" class="primary">导出 EPUB</button>
@@ -252,18 +253,18 @@
 
       <div class="field"><label>自动分章粒度</label>
         <select id="sSplit">
-          <option value="0">不拆分（整章保留原样）</option>
+          <option value="0" selected>不拆分（整章保留原样）</option>
           <option value="3000">3000 字 / 章</option>
-          <option value="5000" selected>5000 字 / 章</option>
+          <option value="5000">5000 字 / 章</option>
           <option value="10000">10000 字 / 章</option>
         </select>
         <div class="hint" style="padding:4px 0 0;">只对超过该字数的章节生效；文档自带的一级标题永远是章节边界。改完点下方按钮可立即重新分章。</div>
       </div>
       <div class="field">
-        <label style="display:flex;align-items:flex-start;gap:6px;line-height:1.45;">
-          <input type="checkbox" id="chkTocSplit" checked style="margin-top:2px;flex:0 0 auto;"/>
-          <span>导出时按二级标题拆成独立文件（微信读书等<u>按文件</u>建目录的阅读器必备，否则二级目录点不动；标准阅读器两种都正常）</span>
-        </label>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <label for="chkTocSplit" style="white-space:nowrap;color:var(--text);font-size:13px;cursor:pointer;">二级标题分章</label>
+          <input type="checkbox" id="chkTocSplit" style="width:auto;flex:0 0 auto;"/>
+        </div>
       </div>
       <div class="field">
         <button id="btnResplit" style="width:100%;padding:6px 8px;">按此重新分章</button>
@@ -839,8 +840,12 @@ function syncTreeActive(){
 $('toolbar').addEventListener('mousedown', e=>{
   const b=e.target.closest('button'); if(!b) return;
   const cmd=b.dataset.cmd; const val=b.dataset.val;
-  if(!cmd) return;
+  /* 关键：工具栏内「所有按钮」都必须 preventDefault，否则点击会让 contenteditable 失焦、
+     选区被销毁——导致「首行缩进 / 插入图片」这类依赖选区的按钮点了完全不生效。
+     （带 data-cmd 的按钮本来就会被处理；btnIndent / btnImg 没有 data-cmd，
+      以前在 if(!cmd) return 处提前返回、漏掉了 preventDefault，正是首行缩进失效的根因。） */
   e.preventDefault();
+  if(!cmd) return;
   editor.focus();
   if(cmd==='formatBlock'){ document.execCommand('formatBlock',false,val); }
   else if(cmd==='justifyLeft'||cmd==='justifyCenter'||cmd==='justifyRight'){
@@ -961,6 +966,7 @@ function readText(file, cb){
   r.readAsText(file, 'utf-8');
 }
 $('export').addEventListener('click', exportEpub);
+$('newBtn').addEventListener('click', newFile);
 
 /* ---------- 导入 Markdown（.md → 章节 + 合规 XHTML） ---------- */
 function escapeHtml(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -1179,6 +1185,33 @@ async function importEpub(file){
     console.error(err);
     alert('导入失败：'+(err&&err.message?err.message:err));
   }
+}
+
+/* ---------- 新建空白文件 ---------- */
+function newFile(){
+  const text = book.chapters.map(c=>(c.html||'').replace(/<[^>]*>/g,'').replace(/&nbsp;/g,' ').trim()).join('');
+  const metaFilled = (book.meta.title||'')+(book.meta.author||'')+(book.meta.date||'');
+  const hasImg = book._images && Object.keys(book._images).length>0;
+  const hasContent = text.length>0 || metaFilled.trim().length>0 || hasImg;
+  if(hasContent && !confirm('新建文件将清空当前所有章节与书名信息。\n当前草稿会先自动备份到浏览器本地（保留最近 5 份，可找回），确定新建空白书？')) return;
+  if(!hasContent && !confirm('确定新建一个空白文件？')) return;
+  /* 备份当前草稿（保留最近 5 份，键名 epub_editor_backup_v1_<时间戳>），误删可找回 */
+  try{
+    commitEditor();
+    const { _images, ...rest } = book;
+    const snap = { book: rest, images: _images||{}, ts: Date.now() };
+    let idx=[];
+    try{ idx=JSON.parse(localStorage.getItem('epub_editor_backups')||'[]'); }catch(e){ idx=[]; }
+    const key='epub_editor_backup_v1_'+Date.now();
+    idx.unshift({ ts:Date.now(), key });
+    idx=idx.slice(0,5);
+    localStorage.setItem(key, JSON.stringify(snap));
+    localStorage.setItem('epub_editor_backups', JSON.stringify(idx));
+  }catch(e){ /* 备份失败不阻断新建 */ }
+  /* 重置为空白书 */
+  book={ meta:{title:'', author:'', language:'zh', date:'', cover:null, style:{lineHeight:1.8, align:'justify'}}, chapters:[ newChapter('第 1 章') ], _images:{} };
+  currentId=book.chapters[0].id;
+  refreshCounts(); renderAll(); selectChapter(currentId); save();
 }
 $('readToggle').addEventListener('click', toggleReading);
 $('rdExit').addEventListener('click', toggleReading);
@@ -1442,13 +1475,15 @@ function buildSectionXhtml(section, imgMap){
     const reform=reformatQianlvBlob(html);
     if(reform && reform!==html) html=reform;
   }
-  /* 给 h2/h3 加锚点 id（标准阅读器内的子标题跳转；拆分模式下每条已是独立文件，id 不影响跳转但无害） */
+  /* 给 h2/h3 加锚点 id（标准阅读器内的子标题跳转；拆分模式下每条已是独立文件，id 不影响跳转但无害）。
+     注意：真实书源里 h2/h3 可能已自带 id（如 id="h3-1"），先清掉旧 id 再注入，避免产生重复 id 属性（不规范且某些校验器会报错）。 */
   const heads=chapterHeadingList(html, (section.chapter||0)+1);
   let k=0;
   html = html.replace(/<(h2|h3)\b([^>]*)>/gi, (m,tag,attrs)=>{
     const id=(heads[k]&&heads[k].id)||('h'+((section.chapter||0)+1)+'-'+(k+1));
     k++;
-    return `<${tag} id="${id}"${attrs}>`;
+    const cleanAttrs=attrs.replace(/\s+id="[^"]*"/i,'');
+    return `<${tag} id="${id}"${cleanAttrs}>`;
   });
   /* 实体还原 + 自闭合 + 转义（cleanXhtml），再经浏览器 DOM 重新序列化（lenientToXhtml），
      保证产出合法 XHTML 且完整保留标签 / style 对齐 / 换行 / 图片——不再依赖易碎的 XML 严格解析与保底分支。 */
@@ -1543,7 +1578,7 @@ function buildNcx(sections){
     if(secs.length===1 && secs[0].single){
       const file=secs[0].href;
       const cId='np'+(++play);
-      navMap+=`<navPoint id="${cId}" playOrder="${play}"><navLabel><text>${escapeXml(chTitle)}</text></navLabel><content src="${file}"/></navPoint>`;
+      navMap+=`<navPoint id="${cId}" playOrder="${play}"><navLabel><text>${escapeXml(chTitle)}</text></navLabel><content src="${file}"/>`;
       const heads=chapterHeadingList(ch.html, ci+1);
       let pendingH2=null, h2Children='';
       const closeH2=()=>{ if(pendingH2){ navMap+=`<navPoint id="${pendingH2.id}" playOrder="${pendingH2.play}"><navLabel><text>${escapeXml(pendingH2.text)}</text></navLabel><content src="${file}#${pendingH2.hid}"/>`+h2Children+'</navPoint>'; h2Children=''; } };
@@ -1556,12 +1591,12 @@ function buildNcx(sections){
     } else {
       const first=secs[0];
       const cId='np'+(++play);
-      navMap+=`<navPoint id="${cId}" playOrder="${play}"><navLabel><text>${escapeXml(chTitle)}</text></navLabel><content src="${first.href}"/></navPoint>`;
+      navMap+=`<navPoint id="${cId}" playOrder="${play}"><navLabel><text>${escapeXml(chTitle)}</text></navLabel><content src="${first.href}"/>`;
       const subs=(first.isHead)?secs.slice(1):secs.slice(0);
       const h2s=subs.filter(s=>s.level===2);
       h2s.forEach(h2=>{
         const id='np'+(++play); depth=Math.max(depth,2);
-        navMap+=`<navPoint id="${id}" playOrder="${play}"><navLabel><text>${escapeXml(h2.title)}</text></navLabel><content src="${h2.href}"/></navPoint>`;
+        navMap+=`<navPoint id="${id}" playOrder="${play}"><navLabel><text>${escapeXml(h2.title)}</text></navLabel><content src="${h2.href}"/>`;
         const kids=subs.filter(s=>s.level===3 && s.parent===h2.href);
         kids.forEach(k=>{ const kid='np'+(++play); depth=Math.max(depth,3); navMap+=`<navPoint id="${kid}" playOrder="${play}"><navLabel><text>${escapeXml(k.title)}</text></navLabel><content src="${k.href}"/></navPoint>`; });
         navMap+='</navPoint>';
